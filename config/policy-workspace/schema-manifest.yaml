@@ -1,0 +1,8 @@
+version: 1
+database:
+  engine: postgresql-compatible
+  data_classification: public_application_data
+  notes:
+    - The read-only database user is the permission boundary.
+    - This manifest is prompting guidance only and must not be treated as authorization.
+schemas: []

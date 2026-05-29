@@ -1,0 +1,47 @@
+services:
+  backend:
+    image: your-nestjs-telegraf-backend:latest
+    depends_on:
+      - agent-sidecar
+    networks:
+      - app_private
+
+  agent-sidecar:
+    image: agent-sidecar:latest
+    build:
+      context: ..
+    read_only: true
+    user: "10001:10001"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    expose:
+      - "8080"
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    volumes:
+      - ../config/policy-workspace:/opt/agent-sidecar/policy:ro
+      - codex-auth:/codex-auth:ro
+    environment:
+      SIDECAR_BIND_ADDR: "0.0.0.0:8080"
+      SIDECAR_POLICY_WORKSPACE: "/opt/agent-sidecar/policy"
+      SIDECAR_RESPONSE_SCHEMA: "/opt/agent-sidecar/policy/response.schema.json"
+      SIDECAR_CODEX_HOME: "/codex-auth"
+      SIDECAR_PROVIDER_TIMEOUT_SECONDS: "120"
+      SIDECAR_SECRET_FILE_PATHS: "/codex-auth/auth.json"
+      PGHOST: "postgres"
+      PGPORT: "5432"
+      PGDATABASE: "public_data"
+      PGUSER: "ai_readonly"
+      PGPASSWORD: "${SIDECAR_PGPASSWORD:?set in deployment environment}"
+      PGSSLMODE: "disable"
+    networks:
+      - app_private
+
+networks:
+  app_private:
+    driver: bridge
+
+volumes:
+  codex-auth:
