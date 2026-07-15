@@ -5,3 +5,5 @@ _ignore/
 .env
 .env.*
 !.env.example
+
+./_archive
