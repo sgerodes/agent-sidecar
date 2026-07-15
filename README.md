@@ -2,7 +2,7 @@
 
 Rust AI Sidecar service for running Codex subscription CLI inside a restricted Docker container.
 
-V1 is intentionally narrow: private REST API in, supervised `codex exec` out, direct read-only PostgreSQL access through `psql`, structured JSON responses, and fail-closed egress secret filtering.
+V1 is intentionally narrow: private REST API in, optional Security AI gate, supervised `codex exec` executor, optional read-only PostgreSQL access through `psql`, structured JSON responses, and fail-closed egress secret filtering.
 
 ## API
 
@@ -41,15 +41,32 @@ Successful response:
   "diagnostics": {
     "duration_ms": 2500,
     "secret_filter_checked": true,
-    "provider_stdout_bytes": 42,
-    "provider_stderr_bytes": 0
+    "executor_stdout_bytes": 42,
+    "executor_stderr_bytes": 0,
+    "executor_db_access_enabled": true,
+    "security_ai_enabled": true,
+    "security_ai_checked": true,
+    "security_ai_decision": "allow",
+    "security_ai_reason": "safe_request",
+    "security_ai_duration_ms": 800,
+    "security_ai_stdout_bytes": 36,
+    "security_ai_stderr_bytes": 0
   }
 }
 ```
 
+Error responses always include `request_id`, `status`, `error.code`, and `error.message`. Common codes:
+
+- `security_ai_blocked`
+- `security_ai_timeout`
+- `security_ai_invalid_output`
+- `executor_ai_timeout`
+- `executor_ai_invalid_output`
+- `executor_ai_egress_secret_detected`
+
 ## Configuration
 
-Required:
+Required when `SIDECAR_EXECUTOR_DB_ACCESS_ENABLED=true`:
 
 - `PGHOST`
 - `PGDATABASE`
@@ -60,7 +77,13 @@ Common optional settings:
 
 - `SIDECAR_BIND_ADDR`, default `0.0.0.0:8080`
 - `SIDECAR_POLICY_WORKSPACE`, default `/opt/agent-sidecar/policy`
-- `SIDECAR_RESPONSE_SCHEMA`, default `<policy workspace>/response.schema.json`
+- `SIDECAR_EXECUTOR_RESPONSE_SCHEMA`, default `<policy workspace>/response.schema.json`
+- `SIDECAR_EXECUTOR_PROMPT_PATH`, default `<policy workspace>/prompts/executor/default.md`
+- `SIDECAR_EXECUTOR_DB_ACCESS_ENABLED`, default `true`
+- `SIDECAR_SECURITY_AI_ENABLED`, default `true`
+- `SIDECAR_SECURITY_AI_RESPONSE_SCHEMA`, default `<policy workspace>/security-response.schema.json`
+- `SIDECAR_SECURITY_AI_PROMPT_PATH`, default `<policy workspace>/prompts/security/default.md`
+- `SIDECAR_SECURITY_AI_TIMEOUT_SECONDS`, default `30`
 - `SIDECAR_CODEX_COMMAND`, default `codex`
 - `SIDECAR_CODEX_HOME`, provider auth directory
 - `SIDECAR_CODEX_MODEL`, optional Codex model override
@@ -69,6 +92,8 @@ Common optional settings:
 - `SIDECAR_CANARY_SECRETS`, comma-separated canary secrets for tests
 
 The service refuses to start if API-key style model credentials such as `OPENAI_API_KEY` are present. This project is subscription-CLI only.
+
+When Security AI is enabled, `/v1/chat` first runs a stateless security review using only the stored security prompt and current `user_message`. Any non-`allow` result, timeout, process failure, or invalid JSON blocks executor execution.
 
 ## Docker
 
@@ -89,7 +114,8 @@ Run locally with a configured Codex subscription login and PostgreSQL environmen
 
 ```sh
 SIDECAR_POLICY_WORKSPACE="$PWD/config/policy-workspace" \
-SIDECAR_RESPONSE_SCHEMA="$PWD/config/policy-workspace/response.schema.json" \
+SIDECAR_EXECUTOR_RESPONSE_SCHEMA="$PWD/config/policy-workspace/response.schema.json" \
+SIDECAR_SECURITY_AI_RESPONSE_SCHEMA="$PWD/config/policy-workspace/security-response.schema.json" \
 SIDECAR_CODEX_HOME="$HOME/.codex" \
 PGHOST=localhost \
 PGPORT=5432 \
@@ -108,7 +134,7 @@ Default tests use fake providers. Ignored integration tests exercise the real Co
 ```sh
 SIDECAR_RUN_REAL_CODEX_TESTS=1 \
 SIDECAR_POLICY_WORKSPACE="$PWD/config/policy-workspace" \
-SIDECAR_RESPONSE_SCHEMA="$PWD/config/policy-workspace/response.schema.json" \
+SIDECAR_EXECUTOR_RESPONSE_SCHEMA="$PWD/config/policy-workspace/response.schema.json" \
 SIDECAR_CODEX_HOME="$HOME/.codex" \
 PGHOST=localhost \
 PGPORT=5432 \

@@ -4,6 +4,7 @@ use agent_sidecar::{
     codex::{CodexRunner, ProviderError},
     config::{CodexConfig, PostgresConfig},
     models::ChatRequest,
+    prompt::build_executor_prompt,
     secret_filter::SecretFilter,
 };
 
@@ -44,14 +45,14 @@ async fn real_codex_returns_schema_valid_output_without_leaking_canary() {
             model: std::env::var("SIDECAR_CODEX_MODEL").ok(),
             timeout: Duration::from_secs(120),
             policy_workspace: required("SIDECAR_POLICY_WORKSPACE").into(),
-            response_schema_path: required("SIDECAR_RESPONSE_SCHEMA").into(),
+            response_schema_path: required("SIDECAR_EXECUTOR_RESPONSE_SCHEMA").into(),
             codex_home: std::env::var("SIDECAR_CODEX_HOME").ok().map(Into::into),
             sandbox: "read-only".to_owned(),
             path_env: std::env::var("SIDECAR_CODEX_PATH")
                 .unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_owned()),
         },
-        database,
         Arc::new(filter),
+        database.codex_env(),
     );
 
     let request = ChatRequest {
@@ -62,9 +63,18 @@ async fn real_codex_returns_schema_valid_output_without_leaking_canary() {
         ),
         metadata: Default::default(),
     };
+    let prompt = build_executor_prompt(
+        "Return only JSON matching the configured schema.",
+        &request,
+        true,
+    )
+    .expect("prompt");
 
-    match runner.run(&request).await {
-        Ok(result) => assert!(!result.answer.contains(canary)),
+    match runner
+        .run_json::<agent_sidecar::models::ProviderStructuredOutput>(&prompt)
+        .await
+    {
+        Ok(result) => assert!(!result.output.answer.contains(canary)),
         Err(ProviderError::SecretDetected { .. }) => {}
         Err(error) => panic!("unexpected provider error: {error}"),
     }

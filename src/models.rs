@@ -46,8 +46,16 @@ pub enum ResponseStatus {
 pub struct ResponseDiagnostics {
     pub duration_ms: u128,
     pub secret_filter_checked: bool,
-    pub provider_stdout_bytes: usize,
-    pub provider_stderr_bytes: usize,
+    pub executor_stdout_bytes: usize,
+    pub executor_stderr_bytes: usize,
+    pub executor_db_access_enabled: bool,
+    pub security_ai_enabled: bool,
+    pub security_ai_checked: bool,
+    pub security_ai_decision: Option<String>,
+    pub security_ai_reason: Option<String>,
+    pub security_ai_duration_ms: Option<u128>,
+    pub security_ai_stdout_bytes: Option<usize>,
+    pub security_ai_stderr_bytes: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

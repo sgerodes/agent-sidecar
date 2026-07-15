@@ -16,6 +16,14 @@ _Avoid_: project workspace, app repository, mounted source
 A sidecar-owned description of the database shape available for AI prompting. It is convenience context only; database credentials and roles define actual access.
 _Avoid_: database policy, authorization schema, source of truth
 
+**Security AI**:
+A stateless AI gate that reviews the current user message before executor execution. It returns a concise allow/block judgement and reason, but does not get database access or sticky session context.
+_Avoid_: firewall, authorization service, audit database
+
+**Executor AI**:
+The front-facing AI execution module that answers approved user requests. It may receive database access when configured, and its output is returned through the REST API after validation and egress filtering.
+_Avoid_: security reviewer, policy engine
+
 **Egress Secret Filter**:
 A fail-closed output check that blocks provider output when it appears to contain protected secrets or configured secret fragments. It is a defense-in-depth control, not a proof that secrets are unreachable.
 _Avoid_: purificator, sanitizer, redactor
@@ -37,3 +45,7 @@ Domain expert: "No. The Schema Manifest helps the model write useful SQL. The da
 Developer: "What happens if Codex tries to return a database password?"
 
 Domain expert: "The Egress Secret Filter detects the Protected Secret and the request fails closed."
+
+Developer: "Does the Security AI keep chat history?"
+
+Domain expert: "No. It is pure per request: stored security prompt plus current user message only."

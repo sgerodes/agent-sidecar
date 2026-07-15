@@ -11,18 +11,20 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
-    codex::{CodexRunner, ProviderError},
+    codex::ProviderError,
     database::DatabaseReadiness,
     models::{
         ChatRequest, ChatResponse, ErrorBody, ErrorResponse, ErrorStatus, ResponseDiagnostics,
         ResponseStatus,
     },
+    security::SecurityDecision,
+    service::{ChatService, ChatServiceError},
 };
 
 #[derive(Clone)]
 pub struct AppState {
-    pub provider: Arc<CodexRunner>,
-    pub database: DatabaseReadiness,
+    pub chat_service: Arc<ChatService>,
+    pub database: Option<DatabaseReadiness>,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -38,13 +40,17 @@ async fn healthz() -> Json<serde_json::Value> {
 }
 
 async fn readyz(State(state): State<AppState>) -> Response {
-    match state.database.check().await {
-        Ok(()) => Json(json!({ "status": "ready" })).into_response(),
+    let Some(database) = &state.database else {
+        return Json(json!({ "status": "ready", "database": "disabled" })).into_response();
+    };
+
+    match database.check().await {
+        Ok(()) => Json(json!({ "status": "ready", "database": "ready" })).into_response(),
         Err(error) => {
             tracing::warn!(error = %error, "database readiness check failed");
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "status": "not_ready" })),
+                Json(json!({ "status": "not_ready", "database": "not_ready" })),
             )
                 .into_response()
         }
@@ -65,22 +71,31 @@ async fn chat(
         ));
     }
 
-    let provider_result = state
-        .provider
-        .run(&request)
+    let result = state
+        .chat_service
+        .handle(&request)
         .await
-        .map_err(|error| ApiError::from_provider(request_id, error))?;
+        .map_err(|error| ApiError::from_service(request_id, error))?;
+    let security = result.security_ai_result.as_ref();
 
     Ok(Json(ChatResponse {
         request_id,
         status: ResponseStatus::Completed,
-        answer: provider_result.answer,
+        answer: result.answer,
         provider: "codex".to_owned(),
         diagnostics: ResponseDiagnostics {
-            duration_ms: provider_result.duration_ms,
+            duration_ms: result.executor_stats.duration_ms,
             secret_filter_checked: true,
-            provider_stdout_bytes: provider_result.stdout_bytes,
-            provider_stderr_bytes: provider_result.stderr_bytes,
+            executor_stdout_bytes: result.executor_stats.stdout_bytes,
+            executor_stderr_bytes: result.executor_stats.stderr_bytes,
+            executor_db_access_enabled: result.executor_db_access_enabled,
+            security_ai_enabled: state.chat_service.security_ai_enabled(),
+            security_ai_checked: security.is_some(),
+            security_ai_decision: security.map(|audit| decision_name(audit.decision).to_owned()),
+            security_ai_reason: security.map(|audit| audit.reason.clone()),
+            security_ai_duration_ms: security.map(|audit| audit.stats.duration_ms),
+            security_ai_stdout_bytes: security.map(|audit| audit.stats.stdout_bytes),
+            security_ai_stderr_bytes: security.map(|audit| audit.stats.stderr_bytes),
         },
     }))
 }
@@ -103,11 +118,37 @@ impl ApiError {
         }
     }
 
-    fn from_provider(request_id: Uuid, error: ProviderError) -> Self {
+    fn from_service(request_id: Uuid, error: ChatServiceError) -> Self {
+        match error {
+            ChatServiceError::SecurityBlocked { reason } => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    reason,
+                    "security AI blocked request"
+                );
+
+                Self {
+                    request_id: Some(request_id),
+                    status: StatusCode::FORBIDDEN,
+                    code: "security_ai_blocked",
+                    message: format!("request blocked by security AI: {reason}"),
+                }
+            }
+            ChatServiceError::SecurityAiFailed(error) => {
+                Self::from_provider_error(request_id, "security_ai", error)
+            }
+            ChatServiceError::ExecutorFailed(error) => {
+                Self::from_provider_error(request_id, "executor_ai", error)
+            }
+        }
+    }
+
+    fn from_provider_error(request_id: Uuid, stage: &'static str, error: ProviderError) -> Self {
         match error {
             ProviderError::SecretDetected { stream, detection } => {
                 tracing::warn!(
                     request_id = %request_id,
+                    stage,
                     stream,
                     rule = detection.label,
                     "provider output blocked by egress secret filter"
@@ -116,15 +157,15 @@ impl ApiError {
                 Self {
                     request_id: Some(request_id),
                     status: StatusCode::BAD_GATEWAY,
-                    code: "egress_secret_detected",
-                    message: "provider output failed safety checks".to_owned(),
+                    code: stage_code(stage, "egress_secret_detected"),
+                    message: format!("{stage} output failed secret safety checks"),
                 }
             }
             ProviderError::Timeout => Self {
                 request_id: Some(request_id),
                 status: StatusCode::GATEWAY_TIMEOUT,
-                code: "provider_timeout",
-                message: "provider run timed out".to_owned(),
+                code: stage_code(stage, "timeout"),
+                message: format!("{stage} timed out"),
             },
             ProviderError::ProcessFailed {
                 code,
@@ -133,6 +174,7 @@ impl ApiError {
             } => {
                 tracing::warn!(
                     request_id = %request_id,
+                    stage,
                     exit_code = ?code,
                     stdout_bytes,
                     stderr_bytes,
@@ -142,24 +184,29 @@ impl ApiError {
                 Self {
                     request_id: Some(request_id),
                     status: StatusCode::BAD_GATEWAY,
-                    code: "provider_process_failed",
-                    message: "provider process failed".to_owned(),
+                    code: stage_code(stage, "process_failed"),
+                    message: format!("{stage} process failed"),
                 }
             }
             ProviderError::InvalidOutput(_) => Self {
                 request_id: Some(request_id),
                 status: StatusCode::BAD_GATEWAY,
-                code: "provider_invalid_output",
-                message: "provider returned invalid structured output".to_owned(),
+                code: stage_code(stage, "invalid_output"),
+                message: format!("{stage} returned invalid JSON output"),
             },
             ProviderError::Prompt(_) | ProviderError::Spawn(_) | ProviderError::WritePrompt(_) => {
-                tracing::error!(request_id = %request_id, error = %error, "provider execution failed");
+                tracing::error!(
+                    request_id = %request_id,
+                    stage,
+                    error = %error,
+                    "provider execution failed"
+                );
 
                 Self {
                     request_id: Some(request_id),
                     status: StatusCode::BAD_GATEWAY,
-                    code: "provider_execution_failed",
-                    message: "provider execution failed".to_owned(),
+                    code: stage_code(stage, "execution_failed"),
+                    message: format!("{stage} execution failed"),
                 }
             }
         }
@@ -178,5 +225,28 @@ impl IntoResponse for ApiError {
         };
 
         (self.status, Json(body)).into_response()
+    }
+}
+
+fn decision_name(decision: SecurityDecision) -> &'static str {
+    match decision {
+        SecurityDecision::Allow => "allow",
+        SecurityDecision::Block => "block",
+    }
+}
+
+fn stage_code(stage: &'static str, suffix: &'static str) -> &'static str {
+    match (stage, suffix) {
+        ("security_ai", "egress_secret_detected") => "security_ai_egress_secret_detected",
+        ("security_ai", "timeout") => "security_ai_timeout",
+        ("security_ai", "process_failed") => "security_ai_process_failed",
+        ("security_ai", "invalid_output") => "security_ai_invalid_output",
+        ("security_ai", "execution_failed") => "security_ai_execution_failed",
+        ("executor_ai", "egress_secret_detected") => "executor_ai_egress_secret_detected",
+        ("executor_ai", "timeout") => "executor_ai_timeout",
+        ("executor_ai", "process_failed") => "executor_ai_process_failed",
+        ("executor_ai", "invalid_output") => "executor_ai_invalid_output",
+        ("executor_ai", "execution_failed") => "executor_ai_execution_failed",
+        _ => "provider_execution_failed",
     }
 }

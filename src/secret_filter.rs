@@ -43,11 +43,13 @@ pub enum SecretFilterError {
 impl SecretFilter {
     pub fn from_config(
         config: &SecretFilterConfig,
-        database: &PostgresConfig,
+        database: Option<&PostgresConfig>,
     ) -> Result<Self, SecretFilterError> {
         let mut candidates = Vec::new();
 
-        candidates.push(("postgres.password".to_owned(), database.password.clone()));
+        if let Some(database) = database {
+            candidates.push(("postgres.password".to_owned(), database.password.clone()));
+        }
 
         for (index, secret) in config.canary_secrets.iter().enumerate() {
             candidates.push((format!("canary.{index}"), secret.clone()));

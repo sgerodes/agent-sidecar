@@ -37,6 +37,8 @@ docker run --rm \
   -c 'test "$(id -u)" = "10001" \
     && test ! -w / \
     && test -r /opt/agent-sidecar/policy/AGENTS.md \
+    && test -r /opt/agent-sidecar/policy/security-response.schema.json \
+    && test -r /opt/agent-sidecar/policy/prompts/security/default.md \
     && command -v psql >/dev/null \
     && command -v codex >/dev/null'
 

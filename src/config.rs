@@ -15,12 +15,30 @@ const API_BILLING_ENV_VARS: &[&str] = &[
     "CLAUDE_API_KEY",
 ];
 
+const DEFAULT_EXECUTOR_TIMEOUT_SECONDS: u64 = 120;
+const DEFAULT_SECURITY_AI_TIMEOUT_SECONDS: u64 = 30;
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub bind_addr: SocketAddr,
-    pub codex: CodexConfig,
-    pub database: PostgresConfig,
+    pub executor: ExecutorConfig,
+    pub security_ai: SecurityAiConfig,
+    pub database: Option<PostgresConfig>,
     pub secret_filter: SecretFilterConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExecutorConfig {
+    pub codex: CodexConfig,
+    pub prompt_path: PathBuf,
+    pub database_access_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SecurityAiConfig {
+    pub enabled: bool,
+    pub codex: CodexConfig,
+    pub prompt_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -68,36 +86,97 @@ pub enum ConfigError {
 impl AppConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         reject_api_billing_env()?;
+        let policy_workspace = path_env_or(
+            "SIDECAR_POLICY_WORKSPACE",
+            "/opt/agent-sidecar/policy".as_ref(),
+        );
+        let database_access_enabled = parse_bool_env("SIDECAR_EXECUTOR_DB_ACCESS_ENABLED", true)?;
 
         Ok(Self {
             bind_addr: parse_env("SIDECAR_BIND_ADDR", "0.0.0.0:8080")?,
-            codex: CodexConfig::from_env()?,
-            database: PostgresConfig::from_env()?,
+            executor: ExecutorConfig::from_env(&policy_workspace, database_access_enabled)?,
+            security_ai: SecurityAiConfig::from_env(&policy_workspace)?,
+            database: if database_access_enabled {
+                Some(PostgresConfig::from_env()?)
+            } else {
+                None
+            },
             secret_filter: SecretFilterConfig::from_env(),
         })
     }
 }
 
-impl CodexConfig {
-    fn from_env() -> Result<Self, ConfigError> {
-        let policy_workspace = path_env_or(
-            "SIDECAR_POLICY_WORKSPACE",
-            "/opt/agent-sidecar/policy".as_ref(),
-        );
-        let response_schema_path = env::var("SIDECAR_RESPONSE_SCHEMA")
+impl ExecutorConfig {
+    fn from_env(
+        policy_workspace: &Path,
+        database_access_enabled: bool,
+    ) -> Result<Self, ConfigError> {
+        let response_schema_path = optional_env("SIDECAR_EXECUTOR_RESPONSE_SCHEMA")
+            .or_else(|| optional_env("SIDECAR_RESPONSE_SCHEMA"))
             .map(PathBuf::from)
-            .unwrap_or_else(|_| policy_workspace.join("response.schema.json"));
+            .unwrap_or_else(|| policy_workspace.join("response.schema.json"));
 
         Ok(Self {
+            codex: CodexConfig::from_parts(
+                policy_workspace.to_path_buf(),
+                response_schema_path,
+                duration_from_env(
+                    "SIDECAR_PROVIDER_TIMEOUT_SECONDS",
+                    DEFAULT_EXECUTOR_TIMEOUT_SECONDS,
+                )?,
+                optional_env("SIDECAR_CODEX_MODEL"),
+            ),
+            prompt_path: path_env_or(
+                "SIDECAR_EXECUTOR_PROMPT_PATH",
+                &policy_workspace.join("prompts/executor/default.md"),
+            ),
+            database_access_enabled,
+        })
+    }
+}
+
+impl SecurityAiConfig {
+    fn from_env(policy_workspace: &Path) -> Result<Self, ConfigError> {
+        Ok(Self {
+            enabled: parse_bool_env("SIDECAR_SECURITY_AI_ENABLED", true)?,
+            codex: CodexConfig::from_parts(
+                policy_workspace.to_path_buf(),
+                path_env_or(
+                    "SIDECAR_SECURITY_AI_RESPONSE_SCHEMA",
+                    &policy_workspace.join("security-response.schema.json"),
+                ),
+                duration_from_env(
+                    "SIDECAR_SECURITY_AI_TIMEOUT_SECONDS",
+                    DEFAULT_SECURITY_AI_TIMEOUT_SECONDS,
+                )?,
+                optional_env("SIDECAR_SECURITY_AI_CODEX_MODEL")
+                    .or_else(|| optional_env("SIDECAR_CODEX_MODEL")),
+            ),
+            prompt_path: path_env_or(
+                "SIDECAR_SECURITY_AI_PROMPT_PATH",
+                &policy_workspace.join("prompts/security/default.md"),
+            ),
+        })
+    }
+}
+
+impl CodexConfig {
+    fn from_parts(
+        policy_workspace: PathBuf,
+        response_schema_path: PathBuf,
+        timeout: Duration,
+        model: Option<String>,
+    ) -> Self {
+        Self {
             command: env_or("SIDECAR_CODEX_COMMAND", "codex"),
-            model: optional_env("SIDECAR_CODEX_MODEL"),
-            timeout: Duration::from_secs(parse_env("SIDECAR_PROVIDER_TIMEOUT_SECONDS", "120")?),
+            model,
+            timeout,
             policy_workspace,
             response_schema_path,
             codex_home: optional_env("SIDECAR_CODEX_HOME").map(PathBuf::from),
             sandbox: env_or("SIDECAR_CODEX_SANDBOX", "read-only"),
             path_env: env_or("SIDECAR_CODEX_PATH", "/usr/local/bin:/usr/bin:/bin"),
-        })
+        }
     }
 }
 
@@ -211,6 +290,26 @@ where
             key,
             message: error.to_string(),
         })
+}
+
+fn duration_from_env(key: &'static str, default_seconds: u64) -> Result<Duration, ConfigError> {
+    let default = default_seconds.to_string();
+    parse_env(key, &default).map(Duration::from_secs)
+}
+
+fn parse_bool_env(key: &'static str, default: bool) -> Result<bool, ConfigError> {
+    let Some(value) = optional_env(key) else {
+        return Ok(default);
+    };
+
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(ConfigError::InvalidValue {
+            key,
+            message: "expected one of true, false, 1, 0, yes, no, on, off".to_owned(),
+        }),
+    }
 }
 
 fn split_values(key: &str) -> Vec<String> {

@@ -1,25 +1,29 @@
 use std::{process::Stdio, sync::Arc, time::Instant};
 
+use serde::de::DeserializeOwned;
 use thiserror::Error;
 use tokio::{io::AsyncWriteExt, process::Command, time};
 
 use crate::{
-    config::{CodexConfig, PostgresConfig},
-    models::{ChatRequest, ProviderStructuredOutput},
-    prompt::build_codex_prompt,
+    config::CodexConfig,
     secret_filter::{SecretDetection, SecretFilter},
 };
 
 #[derive(Debug, Clone)]
 pub struct CodexRunner {
     config: CodexConfig,
-    database: PostgresConfig,
     secret_filter: Arc<SecretFilter>,
+    extra_env: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
-pub struct ProviderRunResult {
-    pub answer: String,
+pub struct CodexJsonResult<T> {
+    pub output: T,
+    pub stats: ProviderRunStats,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderRunStats {
     pub duration_ms: u128,
     pub stdout_bytes: usize,
     pub stderr_bytes: usize,
@@ -28,7 +32,7 @@ pub struct ProviderRunResult {
 #[derive(Debug, Error)]
 pub enum ProviderError {
     #[error("failed to build provider prompt")]
-    Prompt(#[from] serde_json::Error),
+    Prompt(#[source] serde_json::Error),
 
     #[error("failed to spawn provider")]
     Spawn(#[source] std::io::Error),
@@ -59,18 +63,20 @@ pub enum ProviderError {
 impl CodexRunner {
     pub fn new(
         config: CodexConfig,
-        database: PostgresConfig,
         secret_filter: Arc<SecretFilter>,
+        extra_env: Vec<(String, String)>,
     ) -> Self {
         Self {
             config,
-            database,
             secret_filter,
+            extra_env,
         }
     }
 
-    pub async fn run(&self, request: &ChatRequest) -> Result<ProviderRunResult, ProviderError> {
-        let prompt = build_codex_prompt(request)?;
+    pub async fn run_json<T>(&self, prompt: &str) -> Result<CodexJsonResult<T>, ProviderError>
+    where
+        T: DeserializeOwned,
+    {
         let started_at = Instant::now();
         let mut command = self.build_command();
 
@@ -119,13 +125,15 @@ impl CodexRunner {
             });
         }
 
-        let parsed = parse_provider_output(&stdout).map_err(ProviderError::InvalidOutput)?;
+        let parsed = parse_provider_output::<T>(&stdout).map_err(ProviderError::InvalidOutput)?;
 
-        Ok(ProviderRunResult {
-            answer: parsed.answer,
-            duration_ms: started_at.elapsed().as_millis(),
-            stdout_bytes: output.stdout.len(),
-            stderr_bytes: output.stderr.len(),
+        Ok(CodexJsonResult {
+            output: parsed,
+            stats: ProviderRunStats {
+                duration_ms: started_at.elapsed().as_millis(),
+                stdout_bytes: output.stdout.len(),
+                stderr_bytes: output.stderr.len(),
+            },
         })
     }
 
@@ -166,7 +174,7 @@ impl CodexRunner {
             command.env("CODEX_HOME", codex_home);
         }
 
-        for (key, value) in self.database.codex_env() {
+        for (key, value) in &self.extra_env {
             command.env(key, value);
         }
 
@@ -174,7 +182,10 @@ impl CodexRunner {
     }
 }
 
-fn parse_provider_output(stdout: &str) -> Result<ProviderStructuredOutput, serde_json::Error> {
+fn parse_provider_output<T>(stdout: &str) -> Result<T, serde_json::Error>
+where
+    T: DeserializeOwned,
+{
     let trimmed = stdout.trim();
 
     serde_json::from_str(trimmed).or_else(|_| {
@@ -199,15 +210,17 @@ mod tests {
         time::Duration,
     };
 
+    use serde::Deserialize;
     use tempfile::TempDir;
 
-    use crate::{
-        config::{CodexConfig, PostgresConfig},
-        models::ChatRequest,
-        secret_filter::SecretFilter,
-    };
+    use crate::{config::CodexConfig, secret_filter::SecretFilter};
 
     use super::{CodexRunner, ProviderError};
+
+    #[derive(Debug, Deserialize)]
+    struct TestOutput {
+        answer: String,
+    }
 
     #[tokio::test]
     async fn returns_structured_provider_answer() {
@@ -220,14 +233,14 @@ printf '{"answer":"hello from fake codex"}'
 "#,
         );
 
-        let runner = fake_runner(temp.path(), "fake-codex");
+        let runner = fake_runner(temp.path(), "fake-codex", Vec::new());
         let result = runner
-            .run(&sample_request())
+            .run_json::<TestOutput>("hello")
             .await
             .expect("provider result");
 
-        assert_eq!(result.answer, "hello from fake codex");
-        assert!(result.stdout_bytes > 0);
+        assert_eq!(result.output.answer, "hello from fake codex");
+        assert!(result.stats.stdout_bytes > 0);
     }
 
     #[tokio::test]
@@ -241,9 +254,9 @@ printf '{"answer":"leaked test-db-password-123456"}'
 "#,
         );
 
-        let runner = fake_runner(temp.path(), "fake-codex");
+        let runner = fake_runner(temp.path(), "fake-codex", Vec::new());
         let error = runner
-            .run(&sample_request())
+            .run_json::<TestOutput>("hello")
             .await
             .expect_err("secret detection");
 
@@ -261,31 +274,59 @@ printf 'not json'
 "#,
         );
 
-        let runner = fake_runner(temp.path(), "fake-codex");
+        let runner = fake_runner(temp.path(), "fake-codex", Vec::new());
         let error = runner
-            .run(&sample_request())
+            .run_json::<TestOutput>("hello")
             .await
             .expect_err("invalid json");
 
         assert!(matches!(error, ProviderError::InvalidOutput(_)));
     }
 
-    fn fake_runner(temp_path: &Path, command_name: &str) -> CodexRunner {
+    #[tokio::test]
+    async fn passes_only_configured_extra_env_to_provider() {
+        let temp = TempDir::new().expect("tempdir");
+        write_fake_provider(
+            temp.path(),
+            r#"#!/bin/sh
+cat >/dev/null
+if [ "$PGPASSWORD" = "test-db-password-123456" ]; then
+  printf '{"answer":"db-env-present"}'
+else
+  printf '{"answer":"db-env-missing"}'
+fi
+"#,
+        );
+
+        let runner = fake_runner(
+            temp.path(),
+            "fake-codex",
+            vec![(
+                "PGPASSWORD".to_owned(),
+                "test-db-password-123456".to_owned(),
+            )],
+        );
+        let result = runner
+            .run_json::<TestOutput>("hello")
+            .await
+            .expect("provider result");
+
+        assert_eq!(result.output.answer, "db-env-present");
+    }
+
+    fn fake_runner(
+        temp_path: &Path,
+        command_name: &str,
+        extra_env: Vec<(String, String)>,
+    ) -> CodexRunner {
         let policy_workspace = temp_path.join("policy");
         fs::create_dir_all(&policy_workspace).expect("policy workspace");
         fs::write(policy_workspace.join("response.schema.json"), "{}").expect("schema");
-
-        let database = PostgresConfig {
-            host: "localhost".to_owned(),
-            port: 5432,
-            database: "public_data".to_owned(),
-            user: "ai_readonly".to_owned(),
-            password: "test-db-password-123456".to_owned(),
-            sslmode: None,
-        };
-        let filter =
-            SecretFilter::new([("postgres.password".to_owned(), database.password.clone())])
-                .expect("filter");
+        let filter = SecretFilter::new([(
+            "postgres.password".to_owned(),
+            "test-db-password-123456".to_owned(),
+        )])
+        .expect("filter");
 
         CodexRunner::new(
             CodexConfig {
@@ -298,18 +339,9 @@ printf 'not json'
                 sandbox: "read-only".to_owned(),
                 path_env: "/usr/bin:/bin".to_owned(),
             },
-            database,
             Arc::new(filter),
+            extra_env,
         )
-    }
-
-    fn sample_request() -> ChatRequest {
-        ChatRequest {
-            conversation_id: Some("conversation-1".to_owned()),
-            conversation: Vec::new(),
-            user_message: "hello".to_owned(),
-            metadata: Default::default(),
-        }
     }
 
     fn write_fake_provider(temp_path: &Path, script: &str) -> PathBuf {
