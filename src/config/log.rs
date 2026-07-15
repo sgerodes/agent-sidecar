@@ -23,3 +23,9 @@ impl LogLevel {
         }
     }
 }
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LogConfig {
+    #[serde(default)]
+    pub log_level: LogLevel,
+}

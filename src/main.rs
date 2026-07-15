@@ -1,4 +1,5 @@
 use agent_sidecar::inits;
+use agent_sidecar::ai::service::{prompt};
 
 fn main() -> std::process::ExitCode {
     match inits::init_app() {
@@ -9,9 +10,10 @@ fn main() -> std::process::ExitCode {
         Ok(_) => {}
     }
 
-    let config = agent_sidecar::config::app::get();
 
-    tracing::info!(log_level = config.log_level.as_str(), "application started");
+    let response = prompt("Hello".to_string()).expect("TODO: panic message");
+    tracing::info!(response = response.content, "Response received");
+
 
     std::process::ExitCode::SUCCESS
 }

@@ -1,13 +1,16 @@
 use serde::Deserialize;
 use std::sync::OnceLock;
-use crate::config::logs;
+use crate::config::ai::AiConfig;
+use crate::config::log::LogConfig;
 
 static CONFIG: OnceLock<AppConfig> = OnceLock::new();
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
-    pub log_level: logs::LogLevel,
+    pub log_config: LogConfig,
+    #[serde(default)]
+    pub ai_config: AiConfig,
 }
 
 

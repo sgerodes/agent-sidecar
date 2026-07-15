@@ -1,2 +1,3 @@
 pub mod app;
-pub mod logs;
+pub mod log;
+pub mod ai;
